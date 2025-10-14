@@ -7,35 +7,41 @@ import sys
 
 
 def _load_price_series(symbol: str, data_dir: str) -> pd.Series:
-    """Load Close price series for a symbol from data_dir, indexed by Date."""
+    """Load Adjusted Close price series for a symbol from data_dir, indexed by Date."""
     csv_path = os.path.join(data_dir, f"{symbol}.csv")
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Price file not found for symbol {symbol}: {csv_path}")
     df = pd.read_csv(csv_path)
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.set_index('Date').sort_index()
-    if 'Close' not in df.columns:
-        # Try lowercase or adjusted naming fallbacks
-        for col in ['close', 'Adj Close', 'adj_close', 'AdjClose']:
-            if col in df.columns:
-                df = df.rename(columns={col: 'Close'})
-                break
-    return df['Close']
+    
+    # Use Adjusted Close, fallback to Close if not available
+    if 'Adj Close' in df.columns:
+        price_col = 'Adj Close'
+    elif 'AdjClose' in df.columns:
+        price_col = 'AdjClose'
+    elif 'Close' in df.columns:
+        price_col = 'Close'
+    else:
+        raise ValueError(f"No suitable price column found in {csv_path}")
+    
+    return df[price_col]
 
 
 def _build_trading_calendar(spy_prices: pd.Series, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DatetimeIndex:
-    """Return SPY trading dates between first and last order inclusive."""
+    """Return all trading dates between first and last order inclusive."""
     spy_window = spy_prices.loc[(spy_prices.index >= start_date) & (spy_prices.index <= end_date)]
     return spy_window.index
 
 
-def compute_portvals(orders_file: str = "./orders/orders.csv", start_val: float = 1000000, args=None) -> pd.Series:
+def compute_portvals(orders_file: str = "./orders/orders.csv", start_val: float = 1000000, args=None) -> pd.DataFrame:
     """
     Compute daily portfolio value from orders, priced by CSVs in data_dir.
 
     Orders CSV format: Date,Symbol,Order,Shares
-    Prices are taken from data_dir/<SYMBOL>.csv using the Close column.
+    Prices are taken from data_dir/<SYMBOL>.csv using the Adjusted Close column.
     Commission and market impact are applied per order.
+    Returns pandas.DataFrame with one column of portfolio values.
     """
 
     # Read config
@@ -49,7 +55,7 @@ def compute_portvals(orders_file: str = "./orders/orders.csv", start_val: float 
     orders_df['Date'] = pd.to_datetime(orders_df['Date'])
     orders_df = orders_df.sort_values('Date')
     if orders_df.empty:
-        return pd.Series(dtype=float)
+        return pd.DataFrame(columns=['PortVal'])
 
     first_trade_date = orders_df['Date'].min()
     last_trade_date = orders_df['Date'].max()
@@ -58,7 +64,7 @@ def compute_portvals(orders_file: str = "./orders/orders.csv", start_val: float 
     spy_prices = _load_price_series('SPY', data_dir)
     trading_dates = _build_trading_calendar(spy_prices, first_trade_date, last_trade_date)
     if len(trading_dates) == 0:
-        return pd.Series(dtype=float)
+        return pd.DataFrame(columns=['PortVal'])
 
     # Load symbol price series and align to trading calendar with forward fill
     symbols = sorted(orders_df['Symbol'].unique().tolist())
@@ -95,17 +101,19 @@ def compute_portvals(orders_file: str = "./orders/orders.csv", start_val: float 
                     # if still NaN after ffill, skip
                     continue
 
-                impact_cost = shares * price * market_impact_factor
+                # Market impact is a cash deduction proportional to trade notional
+                impact_penalty = shares * price * market_impact_factor
+                
                 if order_type == 'BUY':
-                    total_cost = shares * price + commission + impact_cost
-                    if cash >= total_cost:
-                        cash -= total_cost
-                        holdings[sym] += shares
+                    # BUY: pay for shares + commission + impact penalty
+                    shares_cost = shares * price
+                    cash -= shares_cost + commission + impact_penalty
+                    holdings[sym] += shares
                 elif order_type == 'SELL':
-                    if holdings[sym] >= shares:
-                        proceeds = shares * price - commission - impact_cost
-                        cash += proceeds
-                        holdings[sym] -= shares
+                    # SELL: receive proceeds - commission - impact penalty
+                    shares_proceeds = shares * price
+                    cash += shares_proceeds - commission - impact_penalty
+                    holdings[sym] -= shares
 
         # End-of-day valuation
         total_value = cash
@@ -117,12 +125,15 @@ def compute_portvals(orders_file: str = "./orders/orders.csv", start_val: float 
                 total_value += qty * price
         portvals.append(total_value)
 
-    return pd.Series(portvals, index=trading_dates)
+    # Return as DataFrame with one column
+    return pd.DataFrame({'PortVal': portvals}, index=trading_dates)
 
 
-def _compute_stats(portvals: pd.Series, benchmark: pd.Series | None = None):
-    dr = portvals.pct_change().dropna()
-    cum_ret = (portvals.iloc[-1] / portvals.iloc[0]) - 1
+def _compute_stats(portvals: pd.DataFrame, benchmark: pd.Series | None = None):
+    # Extract the single column for calculations
+    portval_series = portvals.iloc[:, 0]  # First column
+    dr = portval_series.pct_change().dropna()
+    cum_ret = (portval_series.iloc[-1] / portval_series.iloc[0]) - 1
     avg_daily_ret = dr.mean() if len(dr) else 0.0
     std_daily_ret = dr.std() if len(dr) else 0.0
     sharpe = (avg_daily_ret / std_daily_ret * np.sqrt(252)) if std_daily_ret > 0 else 0.0
@@ -132,15 +143,15 @@ def _compute_stats(portvals: pd.Series, benchmark: pd.Series | None = None):
         'adr': float(avg_daily_ret),
         'sddr': float(std_daily_ret),
         'sr': float(sharpe),
-        'final_val': float(portvals.iloc[-1]),
-        'start_date': portvals.index[0],
-        'end_date': portvals.index[-1],
-        'num_days': len(portvals),
+        'final_val': float(portval_series.iloc[-1]),
+        'start_date': portval_series.index[0],
+        'end_date': portval_series.index[-1],
+        'num_days': len(portval_series),
     }
 
     if benchmark is not None and len(benchmark) > 1:
         # align
-        common = portvals.index.intersection(benchmark.index)
+        common = portval_series.index.intersection(benchmark.index)
         if len(common) > 1:
             b = benchmark.loc[common]
             br = b.pct_change().dropna()
@@ -175,14 +186,19 @@ def test_code(args=None):
         print("No portfolio values computed (check data/orders)")
         return
 
-    # Load benchmark (SPY)
+    # Load benchmark ($SPX)
     try:
-        spy = _load_price_series('SPY', args.data_dir)
-        spy = spy.loc[(spy.index >= portvals.index[0]) & (spy.index <= portvals.index[-1])]
+        spx = _load_price_series('$SPX', args.data_dir)
+        spx = spx.loc[(spx.index >= portvals.index[0]) & (spx.index <= portvals.index[-1])]
     except Exception:
-        spy = None
+        # Fallback to SPY if $SPX not available
+        try:
+            spx = _load_price_series('SPY', args.data_dir)
+            spx = spx.loc[(spx.index >= portvals.index[0]) & (spx.index <= portvals.index[-1])]
+        except Exception:
+            spx = None
 
-    stats = _compute_stats(portvals, spy)
+    stats = _compute_stats(portvals, spx)
 
     print()
     print("--- begin statistics ------------------------------------------------- ")
